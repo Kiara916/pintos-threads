@@ -3,11 +3,11 @@
 #include <inttypes.h>
 #include <round.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include "devices/pit.h"
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -36,9 +36,6 @@ struct sleeping_thread
 /* List of sleeping threads. */
 static struct list sleeping_list;
 
-/* Lock to protect the sleeping_list. */
-static struct lock sleep_lock;
-
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
@@ -53,7 +50,6 @@ timer_init (void)
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
   list_init (&sleeping_list);
-  lock_init (&sleep_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -111,23 +107,22 @@ timer_sleep (int64_t ticks)
   if (ticks <= 0)
     return;
 
-  /* Create a sleeping thread structure. */
-  struct sleeping_thread *st = malloc (sizeof (struct sleeping_thread));
-  ASSERT (st != NULL);
+  /* Create a sleeping thread structure on the stack.
+     This avoids malloc and is safe because we wait on
+     the semaphore before returning from this function. */
+  struct sleeping_thread st;
   
-  st->wake_tick = timer_ticks () + ticks;
-  sema_init (&st->sema, 0);
+  st.wake_tick = timer_ticks () + ticks;
+  sema_init (&st.sema, 0);
   
-  /* Add to sleeping list. */
-  lock_acquire (&sleep_lock);
-  list_push_back (&sleeping_list, &st->elem);
-  lock_release (&sleep_lock);
+  /* Add to sleeping list with interrupts disabled.
+     This is the proper way to synchronize with the interrupt handler. */
+  enum intr_level old_level = intr_disable ();
+  list_push_back (&sleeping_list, &st.elem);
+  intr_set_level (old_level);
   
   /* Wait on the semaphore. The timer interrupt will wake us up. */
-  sema_down (&st->sema);
-  
-  /* Clean up. */
-  free (st);
+  sema_down (&st.sema);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -212,19 +207,15 @@ timer_interrupt (struct intr_frame *args UNUSED)
   while (e != list_end (&sleeping_list))
     {
       struct sleeping_thread *st = list_entry (e, struct sleeping_thread, elem);
+      struct list_elem *next = list_next (e);
       
       if (ticks >= st->wake_tick)
         {
           /* Time to wake this thread. */
-          struct list_elem *next = list_next (e);
           list_remove (e);
           sema_up (&st->sema);
-          e = next;
         }
-      else
-        {
-          e = list_next (e);
-        }
+      e = next;
     }
 }
 
